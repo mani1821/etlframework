@@ -1,0 +1,53 @@
+# Databricks demo config: both sides are Unity Catalog tables created by
+#   generate_sample_data.py --tables main.parity_demo
+# -> main.parity_demo_source.<TABLE> and main.parity_demo_target.<TABLE>.
+# Filters and delta conditions are Spark SQL here (not Oracle SQL).
+
+source:
+  type: table
+  schema: main.parity_demo_source
+
+target:
+  type: table
+  schema: main.parity_demo_target
+
+settings:
+  sample_threshold_rows: 50000      # low on purpose, so the 200k-row FACT_SALES gets sampled
+  target_sample_rows: 20000
+  full_key_check: true
+  count_tolerance_pct: 0.0
+  row_mismatch_tolerance_pct: 0.0
+  mismatch_sample_limit: 20
+  results_path: /Volumes/main/parity_demo/results   # create this Volume first
+
+tables:
+  - name: FACT_SALES
+    keys: [ORDER_ID, ORDER_LINE_NBR]
+    exclude_cols: [SALES_SK, ETL_BATCH_ID, LOAD_TS]
+    num_tolerance: 0.01
+    incremental:
+      source_delta: "ETL_BATCH_ID = ${SRC_BATCH_ID}"
+      target_delta: "ETL_BATCH_ID = ${TGT_BATCH_ID}"
+
+  - name: DIM_CUSTOMER
+    keys: [CUSTOMER_NBR, EFF_FROM_DT]
+    exclude_cols: [CUSTOMER_SK, UPDATE_TS]
+    scd2:
+      business_key: [CUSTOMER_NBR]
+      effective_from: EFF_FROM_DT
+      effective_to: EFF_TO_DT
+      current_flag: CURRENT_FLG
+      current_value: "Y"
+      open_end: "9999-12-31"
+      gap_days: 1
+    incremental:
+      source_delta: "UPDATE_TS >= TIMESTAMP '${SRC_RUN_START}'"
+      target_delta: "UPDATE_TS >= TIMESTAMP '${TGT_RUN_START}'"
+
+  - name: DIM_PRODUCT
+    keys: [PRODUCT_CODE]
+
+  - name: FACT_INVENTORY_SNAPSHOT
+    target_name: FACT_INV_SNAPSHOT
+    keys: [SNAPSHOT_DT, STORE_ID, SKU_ID]
+    exclude_cols: [ETL_BATCH_ID]

@@ -1,12 +1,14 @@
 """
-etl_parity — Informatica vs Talend output parity validation.
+etl_parity — parity validation for an ETL migration: source (existing ETL) vs target (new ETL) output tables.
 
 Both ETLs land tables in Oracle (different envs/schemas). This module reads both
 sides into Spark and runs all comparisons in Spark. Oracle is only used to:
   * serve metadata (ALL_TAB_COLUMNS) and a COUNT(*)
   * apply WHERE conditions (table filter, delta window, sampling) so only needed rows cross the wire
 
-Sampling is key-based (ORA_HASH of the business key), never df.sample():
+Connections are normally Oracle; type: spark reads Parquet tables instead (local testing).
+
+Sampling is key-based (ORA_HASH / xxhash64 of the business key), never df.sample():
 both sides must select the SAME keys or every row looks like a mismatch.
 
 Checks
@@ -43,22 +45,43 @@ DAY_SECONDS = 86_400
 
 # --------------------------------------------------------------------------- config
 @dataclass
-class OracleConn:
-    url: str
-    user: str
-    schema: str
+class Connection:
+    type: str = "oracle"                  # "oracle"; "spark" = Parquet folders; "table" = catalog tables (Databricks/Hive)
+    schema: str = ""                      # oracle: schema (owner); spark: optional sub-folder under path;
+                                          # table: "catalog.schema" or "schema" the tables live in
+    url: Optional[str] = None             # oracle: JDBC URL
+    user: Optional[str] = None            # oracle: database user
     password: Optional[str] = None
     password_env: Optional[str] = None
     fetchsize: int = 10_000
+    path: Optional[str] = None            # spark: folder holding one Parquet folder per table
+
+    def __post_init__(self):
+        self.type = self.type.lower()
+        if self.type == "oracle":
+            missing = [f for f in ("url", "user", "schema") if not getattr(self, f)]
+            if missing:
+                raise ValueError(f"oracle connection needs {missing}")
+        elif self.type == "spark":
+            if not self.path:
+                raise ValueError("spark connection needs path")
+        elif self.type == "table":
+            if not self.schema:
+                raise ValueError("table connection needs schema (e.g. main.parity_demo_source)")
+        else:
+            raise ValueError(f"connection type must be 'oracle', 'spark' or 'table', got {self.type!r}")
 
     def secret(self) -> str:
         return self.password or os.environ[self.password_env]
 
 
+OracleConn = Connection   # old name, kept for compatibility
+
+
 @dataclass
 class Incremental:
-    informatica_delta: str        # Oracle condition: rows the Informatica run inserted/updated
-    talend_delta: str             # Oracle condition: rows the Talend run inserted/updated
+    source_delta: str             # condition: rows the source ETL run inserted/updated
+    target_delta: str             # condition: rows the target ETL run inserted/updated
     delta_only: bool = False      # True -> skip the full-table checks, validate only the delta
 
 
@@ -90,7 +113,7 @@ class TableSpec:
     num_tolerance: float = 0.0                         # absolute tolerance for numeric columns
     ts_truncate: Optional[str] = None                  # "second" -> ignore sub-second drift
     force_full: bool = False                           # never sample this table
-    target_name: Optional[str] = None                  # if the Talend table is named differently
+    target_name: Optional[str] = None                  # if the table is named differently on the target side
     row_mismatch_tolerance_pct: Optional[float] = None  # overrides settings.row_mismatch_tolerance_pct
     incremental: Optional[Incremental] = None          # delta checks for one load run
     scd2: Optional[SCD2] = None                        # history checks for SCD Type 2 tables
@@ -140,13 +163,19 @@ def fill_params(text: Optional[str], params: dict, where: str) -> Optional[str]:
                          f"pass --param {name}=... or set environment variable {name}") from None
 
 
+LEGACY_DELTA_KEYS = {"informatica_delta": "source_delta", "talend_delta": "target_delta"}
+
+
 def build_spec(tcfg: dict, params: dict) -> TableSpec:
     tcfg = dict(tcfg)
     label = tcfg.get("name", "?")
     tcfg["filter"] = fill_params(tcfg.get("filter"), params, f"{label}.filter")
     if tcfg.get("incremental"):
         inc = dict(tcfg["incremental"])
-        for k in ("informatica_delta", "talend_delta"):
+        for old, new in LEGACY_DELTA_KEYS.items():          # accept the older key names
+            if old in inc and new not in inc:
+                inc[new] = inc.pop(old)
+        for k in ("source_delta", "target_delta"):
             if not inc.get(k):
                 raise ValueError(f"{label}.incremental needs {k}")
             inc[k] = fill_params(inc[k], params, f"{label}.incremental.{k}")
@@ -199,6 +228,65 @@ class OracleReader:
         src = f"(SELECT {', '.join(cols)} FROM {self.fq(table)}{inner}) t"
         preds = [f"MOD(ORA_HASH({key_expr}), {n_parts}) = {i}" for i in range(n_parts)]
         return self.spark.read.jdbc(self.conn.url, src, predicates=preds, properties=self._props())
+
+    # SQL dialect helpers (the validator asks the reader, so Oracle and Spark can differ)
+    def key_expr(self, keys: list[str], types: dict[str, str]) -> str:
+        return key_expr(keys, types)
+
+    def sample_condition(self, kexpr: str, buckets: int, total: int) -> str:
+        return f"ORA_HASH({kexpr}, {total - 1}) < {buckets}"
+
+
+class SparkTableReader:
+    """
+    Same interface as OracleReader, but reads Parquet tables with Spark: <path>/[<schema>/]<TABLE>.
+    Used for local testing (and works for tables already in a data lake).
+    Filters and delta conditions are Spark SQL expressions here, not Oracle SQL.
+    """
+
+    def __init__(self, spark: SparkSession, conn: Connection):
+        self.spark, self.conn = spark, conn
+
+    def _path(self, table: str) -> str:
+        base = self.conn.path.rstrip("/")
+        return f"{base}/{self.conn.schema}/{table}" if self.conn.schema else f"{base}/{table}"
+
+    def _df(self, table: str) -> DataFrame:
+        if self.conn.type == "table":                       # catalog table, e.g. main.parity_demo_source.FACT_SALES
+            df = self.spark.table(f"{self.conn.schema}.{table}")
+        else:
+            df = self.spark.read.parquet(self._path(table))
+        return df.toDF(*[c.upper() for c in df.columns])
+
+    def count(self, table: str, where: Optional[str]) -> int:
+        df = self._df(table)
+        return (df.where(where) if where else df).count()
+
+    def columns_meta(self, table: str) -> list[Row]:
+        rows = []
+        for i, f in enumerate(self._df(table).schema.fields, 1):
+            dt = f.dataType
+            prec, scale = (dt.precision, dt.scale) if isinstance(dt, T.DecimalType) else (None, None)
+            rows.append(Row(COLUMN_NAME=f.name, DATA_TYPE=dt.simpleString().upper(), DATA_LENGTH=None,
+                            DATA_PRECISION=prec, DATA_SCALE=scale, NULLABLE="Y" if f.nullable else "N",
+                            COLUMN_ID=i))
+        return rows
+
+    def load(self, table: str, cols: list[str], where: Optional[str], key_expr: str, n_parts: int) -> DataFrame:
+        df = self._df(table)
+        if where:
+            df = df.where(where)          # filter first, so it can use columns that are not selected
+        return df.select(*cols)
+
+    def key_expr(self, keys: list[str], types: dict[str, str]) -> str:
+        return "concat_ws('|', " + ", ".join(f"coalesce(cast(`{k}` as string), '~')" for k in keys) + ")"
+
+    def sample_condition(self, kexpr: str, buckets: int, total: int) -> str:
+        return f"pmod(xxhash64({kexpr}), {total}) < {buckets}"
+
+
+def make_reader(spark: SparkSession, conn: Connection):
+    return OracleReader(spark, conn) if conn.type == "oracle" else SparkTableReader(spark, conn)
 
 
 def key_expr(keys: list[str], types: dict[str, str]) -> str:
@@ -280,7 +368,7 @@ class ParityValidator:
         if spec.force_full or n <= self.s.sample_threshold_rows:
             return where, False
         buckets = max(1, math.ceil(HASH_BUCKETS * self.s.target_sample_rows / n))
-        samp = f"ORA_HASH({kexpr}, {HASH_BUCKETS - 1}) < {buckets}"
+        samp = self.src.sample_condition(kexpr, buckets, HASH_BUCKETS)
         return (f"({where}) AND {samp}" if where else samp), True
 
     def _load_pair(self, spec: TableSpec, cols: list[str], src_where, tgt_where, kexpr: str):
@@ -309,9 +397,9 @@ class ParityValidator:
             if absent:
                 raise ValueError(f"SCD2 column(s) not found on both sides: {absent}")
         non_keys = [c for c in cols if c not in spec.keys]
-        kexpr = key_expr(spec.keys, types)
+        kexpr = self.src.key_expr(spec.keys, types)
         # SCD2: sample whole histories (every version of a business key), never single versions
-        samp_kexpr = key_expr(spec.scd2.business_key, types) if spec.scd2 else kexpr
+        samp_kexpr = self.src.key_expr(spec.scd2.business_key, types) if spec.scd2 else kexpr
 
         if not (spec.incremental and spec.incremental.delta_only):
             self.validate_full(spec, cols, non_keys, kexpr, samp_kexpr)
@@ -351,12 +439,12 @@ class ParityValidator:
     # ---- incremental: rows touched by one load run
     def validate_delta(self, spec: TableSpec, cols, non_keys, kexpr, samp_kexpr):
         t, keys, parts, inc = spec.name, spec.keys, self.s.read_partitions, spec.incremental
-        sw, tw = inc.informatica_delta, inc.talend_delta
+        sw, tw = inc.source_delta, inc.target_delta
 
         # 1. same number of rows touched
         n_s, n_t = self.src.count(t, sw), self.tgt.count(spec.target_name, tw)
         self.rec(t, "delta_row_count", n_s == n_t, n_s, n_t,
-                 f"rows touched by this run | Informatica: {sw} | Talend: {tw}")
+                 f"rows touched by this run | source: {sw} | target: {tw}")
         if n_s == 0 and n_t == 0:
             self.rec(t, "delta_not_empty", False, 0, 0,
                      "both deltas are empty: check the delta filters / run window", status="WARN")
@@ -367,7 +455,7 @@ class ParityValidator:
                             self.src.load(t, keys, sw, kexpr, parts),
                             self.tgt.load(spec.target_name, keys, tw, kexpr, parts),
                             "delta_keys_match", kind_prefix="delta_",
-                            detail="src_value=touched by Informatica only, tgt_value=touched by Talend only")
+                            detail="src_value=touched by source only, tgt_value=touched by target only")
 
         # 3. same values in the touched rows (sampled only if the delta itself is huge)
         s_where, sampled = self._sample(spec, sw, samp_kexpr, max(n_s, n_t))
@@ -376,9 +464,9 @@ class ParityValidator:
         src_df, tgt_df = self._load_pair(spec, cols, s_where, t_where, kexpr)
         try:
             dups = {side: df.groupBy(*keys).count().where("count > 1").count()
-                    for side, df in (("informatica", src_df), ("talend", tgt_df))}
+                    for side, df in (("source", src_df), ("target", tgt_df))}
             self.rec(t, f"delta_duplicate_keys[{scope}]", not any(dups.values()),
-                     dups["informatica"], dups["talend"], "keys appearing more than once in one run's delta")
+                     dups["source"], dups["target"], "keys appearing more than once in one run's delta")
             self.compare_rows(t, spec, keys, non_keys, src_df, tgt_df, scope, dups)
         finally:
             src_df.unpersist(); tgt_df.unpersist()
@@ -411,16 +499,16 @@ class ParityValidator:
         return dups
 
     def reconcile_keys(self, t, keys, src_keys: DataFrame, tgt_keys: DataFrame, check: str,
-                       kind_prefix: str = "", detail: str = "src_value=missing_in_talend, tgt_value=extra_in_talend"):
+                       kind_prefix: str = "", detail: str = "src_value=missing_in_target, tgt_value=extra_in_target"):
         src_keys, tgt_keys = src_keys.distinct(), tgt_keys.distinct()
         missing = src_keys.join(tgt_keys, keys, "left_anti")
         extra = tgt_keys.join(src_keys, keys, "left_anti")
         n_missing, n_extra = missing.count(), extra.count()
         self.rec(t, check, n_missing == 0 and n_extra == 0, n_missing, n_extra, detail)
         if n_missing:
-            self.dump(missing, t, f"{kind_prefix}missing_in_talend")
+            self.dump(missing, t, f"{kind_prefix}missing_in_target")
         if n_extra:
-            self.dump(extra, t, f"{kind_prefix}extra_in_talend")
+            self.dump(extra, t, f"{kind_prefix}extra_in_target")
 
     def compare_rows(self, t, spec, keys, non_keys, src_df, tgt_df, scope, dups: dict):
         if any(dups.values()):
@@ -525,7 +613,7 @@ class ParityValidator:
         expected = sc.gap_days * DAY_SECONDS
         w = Window.partitionBy(*bk).orderBy(frm)
 
-        for side, df in (("informatica", src_df), ("talend", tgt_df)):
+        for side, df in (("source", src_df), ("target", tgt_df)):
             x = df.select(*bk, frm, to, is_current.alias("_cur"), is_open.alias("_open"),
                           F.lead(frm).over(w).alias("_next_from"))
             has_next = F.col("_next_from").isNotNull()
@@ -554,10 +642,10 @@ class ParityValidator:
                      detail=f"{c['cur_not_latest']} current rows that have a later version")
 
         # same number of versions per business key on both sides
-        vs = src_df.groupBy(*bk).agg(F.count(F.lit(1)).alias("versions_informatica"))
-        vt = tgt_df.groupBy(*bk).agg(F.count(F.lit(1)).alias("versions_talend"))
+        vs = src_df.groupBy(*bk).agg(F.count(F.lit(1)).alias("versions_source"))
+        vt = tgt_df.groupBy(*bk).agg(F.count(F.lit(1)).alias("versions_target"))
         d = vs.join(vt, bk, "full_outer").where(
-            F.coalesce("versions_informatica", F.lit(0)) != F.coalesce("versions_talend", F.lit(0)))
+            F.coalesce("versions_source", F.lit(0)) != F.coalesce("versions_target", F.lit(0)))
         n = d.count()
         self.rec(t, f"scd2_version_counts_match[{scope}]", n == 0, detail=f"{n} business keys with a different number of versions")
         if n:
@@ -572,7 +660,7 @@ class ParityValidator:
 
 # --------------------------------------------------------------------------- runner
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Informatica vs Talend parity validation")
+    ap = argparse.ArgumentParser(description="Source vs target parity validation for an ETL migration")
     ap.add_argument("config", help="path to tables.yaml")
     ap.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                     help="value for ${NAME} placeholders in filters, e.g. the run window (repeatable)")
@@ -590,11 +678,18 @@ def main(argv=None):
     with open(a.config) as fh:
         cfg = yaml.safe_load(fh)
     spark = SparkSession.builder.appName("etl_parity").getOrCreate()
+    try:
+        spark.sparkContext.setLogLevel("WARN")
+    except Exception:          # not available on Databricks shared / serverless compute
+        pass
     settings = Settings(**(cfg.get("settings") or {}))
-    v = ParityValidator(spark,
-                        OracleReader(spark, OracleConn(**cfg["informatica"])),
-                        OracleReader(spark, OracleConn(**cfg["talend"])),
-                        settings)
+    src_cfg, tgt_cfg = cfg.get("source") or cfg.get("informatica"), cfg.get("target") or cfg.get("talend")
+    if not (src_cfg and tgt_cfg):
+        raise SystemExit("config needs a 'source:' and a 'target:' connection")
+    src_conn, tgt_conn = Connection(**src_cfg), Connection(**tgt_cfg)
+    if src_conn.type != tgt_conn.type:   # both sides must hash keys the same way for sampling
+        raise SystemExit("source and target connections must have the same type")
+    v = ParityValidator(spark, make_reader(spark, src_conn), make_reader(spark, tgt_conn), settings)
     for tcfg in cfg["tables"]:
         name = str(tcfg.get("name", "?")).upper()
         if only and name not in only:
