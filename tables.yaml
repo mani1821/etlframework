@@ -1,0 +1,59 @@
+informatica:
+  url: jdbc:oracle:thin:@//infa-db.corp:1521/DWHPRD
+  user: PARITY_RO
+  password_env: INFA_DB_PWD
+  schema: DWH_INFA
+
+talend:
+  url: jdbc:oracle:thin:@//talend-db.corp:1521/DWHMIG
+  user: PARITY_RO
+  password_env: TALEND_DB_PWD
+  schema: DWH_TALEND
+
+settings:
+  sample_threshold_rows: 5000000
+  target_sample_rows: 1000000
+  read_partitions: 16
+  full_key_check: true
+  count_tolerance_pct: 0.0
+  row_mismatch_tolerance_pct: 0.0   # % of matched rows allowed to differ in value (0 = every row must match)
+  mismatch_sample_limit: 50
+  results_path: /data/etl_parity
+
+# ${NAME} placeholders below are filled at run time:
+#   spark-submit ... validator.py tables.yaml --param INFA_RUN_START="2026-10-13 02:00:00" ...
+# (or from environment variables of the same name)
+
+tables:
+  - name: DIM_CUSTOMER                       # SCD Type 2 dimension
+    keys: [CUSTOMER_NBR, EFF_FROM_DT]        # business key + effective_from (one row per version)
+    exclude_cols: [CUSTOMER_SK, ETL_BATCH_ID, INSERT_TS, UPDATE_TS]
+    force_full: true
+    scd2:
+      business_key: [CUSTOMER_NBR]
+      effective_from: EFF_FROM_DT
+      effective_to: EFF_TO_DT
+      current_flag: CURRENT_FLG              # optional; without it, current = open-ended row
+      current_value: "Y"
+      open_end: "9999-12-31"                 # open rows use this date (omit if they use NULL)
+      gap_days: 1                            # next EFF_FROM_DT = previous EFF_TO_DT + 1 day
+    incremental:                             # rows each ETL touched in this run
+      informatica_delta: "UPDATE_TS >= TIMESTAMP '${INFA_RUN_START}'"
+      talend_delta: "UPDATE_TS >= TIMESTAMP '${TALEND_RUN_START}'"
+
+  - name: FACT_SALES                         # incremental fact, batch-id based
+    keys: [ORDER_ID, ORDER_LINE_NBR]
+    exclude_cols: [SALES_SK, ETL_BATCH_ID, LOAD_TS]
+    filter: "SALE_DT >= DATE '2026-09-01'"
+    num_tolerance: 0.01                      # per value: 10.00 vs 10.01 counts as equal
+    row_mismatch_tolerance_pct: 30           # per table: pass if <= 30% of matched rows differ (demo value; use e.g. 0.01)
+    ts_truncate: second
+    incremental:
+      informatica_delta: "ETL_BATCH_ID = ${INFA_BATCH_ID}"
+      talend_delta: "ETL_BATCH_ID = ${TALEND_BATCH_ID}"
+      delta_only: false                      # true = check only this run's rows, skip full-table checks
+
+  - name: FACT_INVENTORY_SNAPSHOT            # full-load table: no incremental block
+    target_name: FACT_INV_SNAPSHOT
+    keys: [SNAPSHOT_DT, STORE_ID, SKU_ID]
+    exclude_cols: [ETL_BATCH_ID]
